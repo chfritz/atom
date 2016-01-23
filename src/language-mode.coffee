@@ -242,6 +242,40 @@ class LanguageMode
     tokenizedLine = @editor.displayBuffer.tokenizedBuffer.buildTokenizedLineForRowWithText(bufferRow, line)
     @suggestedIndentForTokenizedLineAtBufferRow(bufferRow, line, tokenizedLine, options)
 
+
+  indentReasons: (tokenizedLine, scopeDescriptor) ->
+    scopeTokens = @config.get("editor.scopes", scope: scopeDescriptor)
+    expressionContinuationTokens =
+      @config.get("editor.expressionContinuation", scope: scopeDescriptor)
+    expressionEndTokens = @config.get("editor.expressionEnd", scope: scopeDescriptor)
+    scopeDepth = 0
+    expression = -1
+
+    # the closing part of a line is any prefix that only holds white space and
+    # closing scopes
+    closingPart = true
+    tokenizedLine.tokens.forEach (token) ->
+      if token.value.match(/^\s*$/)
+        # do nothing
+      else if (scopeTokens.some ([start, end]) -> token.value == start)
+        scopeDepth += 1
+        closingPart = false
+      else if (scopeTokens.some ([start, end]) -> token.value == end)
+        scopeDepth -= 1 unless closingPart
+      else
+        isCommented = token.scopes.some (scope) -> scope.startsWith("comment")
+        if not isCommented
+          expression = scopeDepth
+          closingPart = false
+          expressionEndTokens.forEach (end) ->
+            if (token.value == end)
+              expression = -1
+
+    rtv = {depth: scopeDepth, expression: (expression >= scopeDepth)}
+    console.log rtv
+    rtv
+
+
   # The new logic to be created here makes all decisions based on tokens. It
   # distinguishes two reasons for indentation: block and expression. Blocks are
   # clear (think {..}). Expression based indentation happens when an expression
@@ -252,16 +286,13 @@ class LanguageMode
   # counter reaches a value lower than that of the first token in the term.
   suggestedIndentForTokenizedLineAtBufferRow: (bufferRow, line, tokenizedLine, options) ->
     console.log tokenizedLine, tokenizedLine.tokens, @editor
+
     iterator = tokenizedLine.getTokenIterator()
     iterator.next()
     scopeDescriptor = new ScopeDescriptor(scopes: iterator.getScopes())
-
-    increaseIndentRegex = @increaseIndentRegexForScopeDescriptor(scopeDescriptor)
-    decreaseThisIndentRegex = @decreaseThisIndentRegexForScopeDescriptor(scopeDescriptor)
-    decreaseIndentRegex = @decreaseIndentRegexForScopeDescriptor(scopeDescriptor)
-
-    if not decreaseThisIndentRegex
-      decreaseThisIndentRegex = decreaseIndentRegex
+    scopeTokens = @config.get("editor.scopes", scope: scopeDescriptor)
+    expressionEndTokens = @config.get("editor.expressionEnd", scope: scopeDescriptor)
+    console.log scopeTokens, expressionEndTokens
 
     if options?.skipBlankLines ? true
       precedingRow = @buffer.previousNonBlankRow(bufferRow)
@@ -270,35 +301,56 @@ class LanguageMode
       precedingRow = bufferRow - 1
       return 0 if precedingRow < 0
 
+    if options?.skipBlankLines ? true
+      preceding2Row = @buffer.previousNonBlankRow(precedingRow)
+      return 0 unless preceding2Row?
+    else
+      preceding2Row = precedingRow - 1
+      return 0 if preceding2Row < 0
+
     desiredIndentLevel = @editor.indentationForBufferRow(precedingRow)
-    return desiredIndentLevel unless increaseIndentRegex
+    return desiredIndentLevel unless scopeTokens or expressionEndTokens
 
     unless @editor.isBufferRowCommented(precedingRow)
       precedingLine = @buffer.lineForRow(precedingRow)
       tokenizedPrecedingLine =
         @editor.displayBuffer.tokenizedBuffer
         .buildTokenizedLineForRowWithText(precedingRow, precedingLine)
-
       console.log "preceding", tokenizedPrecedingLine,
       tokenizedPrecedingLine.tokens
+      preceding = @indentReasons tokenizedPrecedingLine, scopeDescriptor
+
+      preceding2Line = @buffer.lineForRow(preceding2Row)
+      tokenizedPreceding2Line =
+        @editor.displayBuffer.tokenizedBuffer
+        .buildTokenizedLineForRowWithText(preceding2Row, preceding2Line)
+      console.log "preceding2", tokenizedPreceding2Line,
+      tokenizedPreceding2Line.tokens
+      preceding2 = @indentReasons tokenizedPreceding2Line, scopeDescriptor
 
       # desiredIndentLevel += 1 if increaseIndentRegex?.testSync(precedingLine)
-      if increaseIndentRegex
-        desiredIndentLevel += @countRegex(increaseIndentRegex, precedingLine, tokenizedPrecedingLine)
-      # desiredIndentLevel -= 1 if decreaseIndentRegex?.testSync(precedingLine)
-      if decreaseIndentRegex
-        desiredIndentLevel -= @countRegex(decreaseIndentRegex, precedingLine, tokenizedPrecedingLine)
-      # we need to add back one if we already closed one scope on the previous line itself
-      if decreaseThisIndentRegex and @countRegex(decreaseThisIndentRegex, precedingLine, tokenizedPrecedingLine)
+      # desiredIndentLevel -= 1 if decreaseNextIndentRegex?.testSync(precedingLine)
+
+      if (preceding.expression and not preceding2.expression)
+        # we have an open expression
         desiredIndentLevel += 1
-
-    unless @buffer.isRowBlank(precedingRow)
-      # desiredIndentLevel -= 1 if decreaseThisIndentRegex?.testSync(line)
-      if decreaseThisIndentRegex and @countRegex(decreaseThisIndentRegex, line, tokenizedLine)
+      if (not preceding.expression and preceding2.expression)
+        # a previously open expression was ended
         desiredIndentLevel -= 1
-      # desiredIndentLevel -= @countRegex(decreaseThisIndentRegex, line) if decreaseThisIndentRegex
+      desiredIndentLevel += preceding.depth
 
-    # console.log("suggestedIndentForTokenizedLineAtBufferRow: rtv", desiredIndentLevel)
+    # while there are only closing scopes and white space at the beginning of
+    # this line, keep reducing the indentation
+    for x in tokenizedLine.tokens by 1
+      if (scopeTokens.some ([start, end]) -> x.value == end)
+        desiredIndentLevel -= 1
+      else if x.value.match(/\S/)
+        break
+
+    # unless @buffer.isRowBlank(precedingRow)
+    #   desiredIndentLevel -= 1 if decreaseIndentRegex?.testSync(line)
+    console.log desiredIndentLevel
+
     Math.max(desiredIndentLevel, 0)
 
   # Calculate a minimum indent level for a range of lines excluding empty lines.
@@ -328,30 +380,15 @@ class LanguageMode
     indentLevel = @suggestedIndentForBufferRow(bufferRow, options)
     @editor.setIndentationForBufferRow(bufferRow, indentLevel, options)
 
-
-  # Count the number of occurence of regex in string, given its tokenized
-  # version, and ignoring any occurence that start inside a quoted string
-  countRegex: (regex, string, tokenized) ->
-    count = 0
-    m = regex.searchSync(string)
-    while (m)
-      isQuoted = false
-      if scopes = tokenized.tokenAtBufferColumn(m[0].start)?.scopes
-        isQuoted = scopes.some (scope) -> scope.startsWith('string.quoted')
-      # console.log quoted
-      count += 1 unless isQuoted
-      m = regex.searchSync(string, m[0].start + 1)
-    count
-
   # Given a buffer row, this decreases the indentation.
   #
   # bufferRow - The row {Number}
   autoDecreaseIndentForBufferRow: (bufferRow) ->
     scopeDescriptor = @editor.scopeDescriptorForBufferPosition([bufferRow, 0])
-    return unless decreaseThisIndentRegex = @decreaseThisIndentRegexForScopeDescriptor(scopeDescriptor)
+    return unless decreaseIndentRegex = @decreaseIndentRegexForScopeDescriptor(scopeDescriptor)
 
     line = @buffer.lineForRow(bufferRow)
-    return unless decreaseThisIndentRegex.testSync(line)
+    return unless decreaseIndentRegex.testSync(line)
 
     currentIndentLevel = @editor.indentationForBufferRow(bufferRow)
     return if currentIndentLevel is 0
@@ -365,11 +402,9 @@ class LanguageMode
     if increaseIndentRegex = @increaseIndentRegexForScopeDescriptor(scopeDescriptor)
       desiredIndentLevel -= 1 unless increaseIndentRegex.testSync(precedingLine)
 
-    if decreaseIndentRegex = @decreaseIndentRegexForScopeDescriptor(scopeDescriptor)
-      desiredIndentLevel -= 1 if decreaseIndentRegex.testSync(precedingLine)
-      # desiredIndentLevel -= @countRegex(decreaseIndentRegex, precedingLine)
+    if decreaseNextIndentRegex = @decreaseNextIndentRegexForScopeDescriptor(scopeDescriptor)
+      desiredIndentLevel -= 1 if decreaseNextIndentRegex.testSync(precedingLine)
 
-    # console.log("autoDecreaseThisIndentForBufferRow: desiredIndentLevel", desiredIndentLevel)
     if desiredIndentLevel >= 0 and desiredIndentLevel < currentIndentLevel
       @editor.setIndentationForBufferRow(bufferRow, desiredIndentLevel)
 
@@ -377,21 +412,14 @@ class LanguageMode
     if pattern = @config.get(property, scope: scopeDescriptor)
       new OnigRegExp(pattern)
 
-  # when the previous line matches this pattern than increase indentation of the
-  # current line
   increaseIndentRegexForScopeDescriptor: (scopeDescriptor) ->
     @getRegexForProperty(scopeDescriptor, 'editor.increaseIndentPattern')
 
-  # when the *current* line matches this pattern than decrease indentation of
-  # the current line (this, e.g., puts closing brackets with nothing before them
-  # at the level of the opening statement, as in the KR style for C)
-  decreaseThisIndentRegexForScopeDescriptor: (scopeDescriptor) ->
-    @getRegexForProperty(scopeDescriptor, 'editor.decreaseThisIndentPattern')
-
-  # when the previous line matches this pattern than decrease indentation of the
-  # current line
   decreaseIndentRegexForScopeDescriptor: (scopeDescriptor) ->
     @getRegexForProperty(scopeDescriptor, 'editor.decreaseIndentPattern')
+
+  decreaseNextIndentRegexForScopeDescriptor: (scopeDescriptor) ->
+    @getRegexForProperty(scopeDescriptor, 'editor.decreaseNextIndentPattern')
 
   foldEndRegexForScopeDescriptor: (scopeDescriptor) ->
     @getRegexForProperty(scopeDescriptor, 'editor.foldEndPattern')
